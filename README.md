@@ -10,6 +10,41 @@ This project is due at 11:59 pm AWST on Friday, 2 October 2026. The unit coordin
 
 You are strongly encouraged to submit earlier to avoid any urgent submission issues, and you may receive a late penalty if you are unable to submit by the deadline.
 
+# Setup
+1. Clone the repository
+```
+git clone https://github.com/TimeAnomalyCode/CITS3011-Diplomacy && cd CITS3011-Diplomacy
+```
+
+1. Setup [pyenv](https://github.com/pyenv/pyenv/) and have the right [build environment](https://github.com/pyenv/pyenv/wiki#suggested-build-environment) according to official docs 
+```
+pyenv install 3.11
+pyenv local 3.11
+```
+
+1. Create a virtual environment in the project directory
+```
+python -m venv .venv
+```
+
+1. Activate the virtual environment
+```
+source .venv/bin/activate
+```
+
+1. Install libraries
+```
+pip install --upgrade pip && pip install -r requirements.txt
+```
+
+1. Run default test or generate json to visualize
+```
+python test.py
+```
+or
+```
+python visualize.py
+```
 
 # Description
 In this project your group is tasked to research, design, develop, evaluate, and analyse an agent for playing the game Diplomacy.
