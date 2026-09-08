@@ -10,7 +10,7 @@ This project is due at 11:59 pm AWST on Friday, 2 October 2026. The unit coordin
 
 You are strongly encouraged to submit earlier to avoid any urgent submission issues, and you may receive a late penalty if you are unable to submit by the deadline.
 
-# Setup
+# Setup (WSL or Linux)
 1. Clone the repository
     ```
     git clone https://github.com/TimeAnomalyCode/CITS3011-Diplomacy && cd CITS3011-Diplomacy
@@ -45,6 +45,7 @@ You are strongly encouraged to submit earlier to avoid any urgent submission iss
     ```
     python visualize.py
     ```
+    > https://diplomacy-app.fly.dev/app/ is the visualizer website. The output json is appended if file exists so make sure to remove the old json when generating a new json for the visualizer
 
 # Description
 In this project your group is tasked to research, design, develop, evaluate, and analyse an agent for playing the game Diplomacy.
