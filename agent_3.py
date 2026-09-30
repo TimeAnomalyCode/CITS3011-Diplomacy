@@ -17,6 +17,25 @@ FALL = {'attack': 600, 'defence': 400, 'proximity': [1000, 100, 30, 10, 6, 5, 4,
 STRENGTH_WEIGHT = 1000 # bonus points for friendly unit adjacent to a province
 COMPETITION_WEIGHT = 1000 # reduce points per enemy units adjacent to a province
 CONVOY_MIN_UTILITY = 0.0 # convoy benefit must exceed the fleet/support opportunity cost
+WINNING_CENTRE_COUNT = 18
+VICTORY_FOCUS_START = 12 # start leaning into a win before the final centre
+VICTORY_CAPTURE_MULTIPLIER = 2.5 # extra weight for a realistic Fall capture
+MAX_SUPPORT_PRESSURE = 2 # plan for up to two likely defensive supports
+
+# Article-inspired strategic theatres on the standard Diplomacy map.
+NORTH_CENTRES = frozenset({
+    'BRE', 'PAR', 'MAR', 'SPA', 'POR', 'LON', 'EDI', 'LVP',
+    'BEL', 'HOL', 'KIE', 'BER', 'MUN', 'DEN', 'SWE', 'NOR', 'STP',
+})
+SOUTH_CENTRES = frozenset({
+    'TUN', 'ROM', 'VEN', 'NAP', 'VIE', 'BUD', 'TRI', 'SER',
+    'GRE', 'BUL', 'RUM', 'ANK', 'CON', 'SMY', 'WAR', 'MOS', 'SEV',
+})
+
+# Austria's standard-map solo route is the southern group plus Munich.
+AUSTRIA_SOLO_ROUTE = SOUTH_CENTRES | frozenset({'MUN'})
+AUSTRIA_BALKAN_CENTRES = frozenset({'SER', 'GRE', 'BUL', 'RUM'})
+AUSTRIA_EASTERN_ROUTE = frozenset({'WAR', 'MOS', 'SEV', 'ANK', 'CON', 'SMY'})
 
 
 
@@ -111,44 +130,245 @@ class StudentAgent(Agent):
     # Step 1 - score every province
     # -----
     def power_sizes(self):
-        """A 17-centre power scores 373, a 1-centre power score 21. So attacking the leader matters far more"""
-        return {p: len(self.game.get_centers(p)) ** 2 + 4 * len(self.game.get_centers(p)) + 16 for p in self.game.powers.keys()}
-    
+        """Return the marginal value of taking one centre from each power.
+
+        Using the difference between n and n-1 centres avoids sending units
+        after a large power's territory solely because its total score is huge.
+        """
+        return {
+            power: 2 * len(self.game.get_centers(power)) + 3
+            for power in self.game.powers.keys()
+        }
+
+    def victory_urgency(self):
+        """Scale win-focused play from 12 centres up to the 18-centre goal."""
+        count = len(self.game.get_centers(self.power_name))
+        return min(1.0, max(0.0,
+                            (count - VICTORY_FOCUS_START) /
+                            (WINNING_CENTRE_COUNT - VICTORY_FOCUS_START)))
+
+    def austria_opening_orders(self, options):
+        """Use the Southern Hedgehog in Austria's information-poor first turn.
+
+        The Fall 1901 position can still switch back to expansion after enemy
+        opening moves are visible. If this is not the standard legal opening,
+        leave the general planner in control.
+        """
+        if (self.power_name != 'AUSTRIA'
+                or self.game.get_current_phase() != 'S1901M'):
+            return None
+
+        orders = [
+            ('BUD', 'A BUD - SER'),
+            ('VIE', 'A VIE - GAL'),
+            ('TRI', 'F TRI - VEN'),
+        ]
+        if all(order in options.get(location, []) for location, order in orders):
+            return [order for _, order in orders]
+        return None
+
+    def strategic_target_weights(self, my_centres):
+        """Soft country-specific solo route prior; local tactics still dominate."""
+        power = self.power_name
+        north_count = len(my_centres & NORTH_CENTRES)
+        south_count = len(my_centres & SOUTH_CENTRES)
+        total = len(my_centres)
+        weights = {centre: 1.0 for centre in self.supply_centres}
+
+        if power in {'ENGLAND', 'FRANCE', 'GERMANY'}:
+            for centre in NORTH_CENTRES:
+                if centre in weights:
+                    weights[centre] = 1.10
+            if north_count >= 8 or total >= 9:
+                for centre in SOUTH_CENTRES:
+                    if centre in weights:
+                        weights[centre] = 1.14
+            if power in {'ENGLAND', 'FRANCE'} and (
+                    north_count >= 7 or total >= 9):
+                if 'TUN' in weights:
+                    weights['TUN'] = 1.38
+                if 'MUN' in weights:
+                    weights['MUN'] = max(weights['MUN'], 1.18)
+            elif power == 'GERMANY' and total >= 8:
+                for centre in ('WAR', 'MAR', 'VIE', 'MOS', 'TUN'):
+                    if centre in weights:
+                        weights[centre] = max(weights[centre], 1.25)
+        elif power in {'AUSTRIA', 'ITALY', 'TURKEY'}:
+            for centre in SOUTH_CENTRES:
+                if centre in weights:
+                    weights[centre] = 1.10
+            if power == 'AUSTRIA':
+                if total < 6:
+                    # Secure the nearby Balkan gains before spreading east.
+                    for centre in AUSTRIA_BALKAN_CENTRES:
+                        if centre in weights:
+                            weights[centre] = 1.22
+                elif total < 10:
+                    # Once the Balkans are established, follow the eastern
+                    # land route toward Russia and the Turkish straits.
+                    for centre in AUSTRIA_EASTERN_ROUTE:
+                        if centre in weights:
+                            weights[centre] = 1.18
+                else:
+                    for centre in AUSTRIA_SOLO_ROUTE:
+                        if centre in weights:
+                            weights[centre] = max(weights[centre], 1.14)
+            if south_count >= 8 or total >= 9:
+                for centre in NORTH_CENTRES:
+                    if centre in weights:
+                        weights[centre] = 1.12
+            if power == 'TURKEY' and south_count >= 4 and 'MUN' in weights:
+                # Reach Munich before the Northern powers form a stalemate line.
+                weights['MUN'] = 1.42
+            elif power == 'AUSTRIA' and (
+                    south_count >= 7 or total >= 10) and 'MUN' in weights:
+                weights['MUN'] = 1.42
+            elif power == 'ITALY' and south_count >= 5 and 'MAR' in weights:
+                weights['MAR'] = 1.38
+        elif power == 'RUSSIA':
+            if north_count + 1 < south_count:
+                focus = NORTH_CENTRES
+            elif south_count + 1 < north_count:
+                focus = SOUTH_CENTRES
+            else:
+                focus = ()
+            for centre in focus:
+                if centre in weights:
+                    weights[centre] = 1.22
+            if north_count >= 6 and south_count >= 6:
+                for centre in ('LON', 'HOL', 'ANK', 'CON', 'VIE', 'TRI'):
+                    if centre in weights:
+                        weights[centre] = max(weights[centre], 1.12)
+        return weights
+
+    def build_role_multiplier(self, unit_type, location, units):
+        """Bias builds toward the army/fleet mix needed for each country's plan."""
+        counts = {'A': 0, 'F': 0}
+        northern_fleets = 0
+        for province, (owner, kind, _) in units.items():
+            if owner != self.power_name:
+                continue
+            counts[kind] += 1
+            if kind == 'F' and province in NORTH_CENTRES:
+                northern_fleets += 1
+
+        power = self.power_name
+        province = base(location)
+        if power == 'AUSTRIA':
+            centre_count = len(self.game.get_centers(power))
+            own_centres = set(self.game.get_centers(power))
+            remaining_naval_route = self.supply_centres - own_centres
+            naval_targets = {'ANK', 'CON', 'SMY', 'TUN', 'ROM', 'NAP'}
+            needs_navy = bool(remaining_naval_route & naval_targets)
+            fleet_cap = 2 if centre_count >= 9 and needs_navy else 1
+            if unit_type == 'A':
+                return 1.16
+            if centre_count >= 9 and needs_navy and counts['F'] < fleet_cap:
+                return 1.18
+            return 0.84
+
+        if power == 'RUSSIA':
+            preferred = ('F' if northern_fleets < 4 else 'A') if (
+                province in NORTH_CENTRES) else 'A'
+            return 1.22 if unit_type == preferred else 0.91
+
+        # Northern plans need fleets, but France still needs an army for
+        # landlocked Munich. After a useful naval core, switch to land builds.
+        fleet_caps = {'ENGLAND': 5, 'FRANCE': 4, 'GERMANY': 2,
+                      'AUSTRIA': 1, 'ITALY': 2, 'TURKEY': 2}
+        cap = fleet_caps.get(power, 2)
+        if power in {'ENGLAND', 'FRANCE'}:
+            if unit_type == 'F':
+                return 1.20 if counts['F'] < cap else 0.88
+            return 0.96 if counts['F'] < cap else 1.16
+
+        preferred = {'GERMANY': 'A', 'AUSTRIA': 'A',
+                     'ITALY': 'A', 'TURKEY': 'A'}.get(power, 'A')
+        multiplier = 1.16 if unit_type == preferred else 0.94
+        # Germany and southern powers keep only a small access/convoy fleet.
+        if unit_type == 'F' and counts['F'] < cap:
+            multiplier = max(multiplier, 1.16)
+        elif unit_type == 'F' and counts['F'] >= cap:
+            multiplier = min(multiplier, 0.92)
+        return multiplier
+
+    def unit_state(self):
+        """Map each occupied province to (power, unit type, exact location)."""
+        units = {}
+        for power in self.game.powers.keys():
+            for unit in self.game.get_units(power):
+                unit_type, location = unit.split()[:2]
+                units[base(location)] = (power, unit_type, location)
+        return units
+
+    def can_support(self, unit_type, location, province):
+        """Whether a unit's movement graph touches a province it could support."""
+        adjacency = self.army_adjacency if unit_type == 'A' else self.fleet_adjacency
+        return any(base(neighbour) == province
+                   for neighbour in adjacency.get(location, []))
+
+    def support_capacity(self, province, power, units=None):
+        """Count nearby units of a power that could support the province."""
+        units = units or self.unit_state()
+        capacity = 0
+        for neighbour in self.neighbours.get(province, ()):
+            unit = units.get(neighbour)
+            if (unit and unit[0] == power
+                    and self.can_support(unit[1], unit[2], province)):
+                capacity += 1
+        return capacity
+
+    def support_requirement(self, province, units=None):
+        """Support needed to beat the occupant and a modest defensive stack."""
+        units = units or self.unit_state()
+        defender = units.get(province)
+        if not defender or defender[0] == self.power_name:
+            return 0
+        pressure = min(MAX_SUPPORT_PRESSURE,
+                       self.support_capacity(province, defender[0], units))
+        return 1 + pressure
+
+    def capture_probability(self, province, occupied, support_count=0, units=None):
+        """Estimate how likely a current attack is to take its destination."""
+        units = units or self.unit_state()
+        if province not in occupied:
+            hostile_neighbours = sum(
+                1 for neighbour in self.neighbours.get(province, ())
+                if neighbour in units and units[neighbour][0] != self.power_name)
+            return max(0.55, 0.97 / (1.0 + 0.14 * hostile_neighbours))
+
+        defender = units.get(province)
+        if not defender:
+            return 0.25
+        defence = 1 + min(MAX_SUPPORT_PRESSURE,
+                          self.support_capacity(province, defender[0], units))
+        margin = (1 + support_count) - defence
+        if margin >= 2:
+            return 0.98
+        if margin == 1:
+            return 0.90
+        if margin == 0:
+            return 0.32
+        return 0.08
+
     def province_scores(self):
-        """Two numbers per province: how badly we want it, and how badly we need to keep it."""
+        """Score centres by marginal gain and the chance of taking them."""
         sizes = self.power_sizes()
         my_centres = set(self.game.get_centers(self.power_name))
-         # Who owns which centre, and who has a unit sitting where. We need both.
         centre_owner = {}
         for power in self.game.powers.keys():
             for centre in self.game.get_centers(power):
                 centre_owner[centre] = power
-        
-        unit_owner = {}
-        for power in self.game.powers.keys():
-            for unit in self.game.get_units(power):
-                unit_owner.setdefault(base(unit.split()[1]), power)
-        
-        attack, defence = {}, {}
-        for province in self.provinces:
-            attack_value = defence_value = 0
-            # Worth taking. Meaning that a supply centre is being held by someone
-            if province in self.supply_centres and province not in my_centres:
-                holder = centre_owner.get(province)
-                attack_value = sizes[holder] if holder else 16
-            # Worth defending. our own centre but has a big enemy close.
-            if province in my_centres:
-                for neighbour in self.neighbours[province]:
-                    other = unit_owner.get(neighbour)
-                    if other and other != self.power_name:
-                        defence_value = max(defence_value, sizes[other])
-            attack[province] = attack_value
-            defence[province] = defence_value
-        
-        # this is a local force ratio. Our units are summed. enemies are taken as a max over powers,
-        # this is because two enemies attacking one province will bounce off one another rather than combining.
-        friendly = {p: 0 for p in self.provinces}
-        hostile = {p: {} for p in self.provinces}
+
+        units = self.unit_state()
+        target_weights = self.strategic_target_weights(my_centres)
+        unit_owner = {province: details[0]
+                      for province, details in units.items()}
+
+        # Count nearby forces before valuing a target. The strongest rival's
+        # local force is used because unrelated enemy powers do not combine.
+        friendly = {province: 0 for province in self.provinces}
+        hostile = {province: {} for province in self.provinces}
         for province in self.provinces:
             for neighbour in self.neighbours[province]:
                 owner = unit_owner.get(neighbour)
@@ -156,9 +376,55 @@ class StudentAgent(Agent):
                     continue
                 if owner == self.power_name:
                     friendly[province] += 1
-                else: 
+                else:
                     hostile[province][owner] = hostile[province].get(owner, 0) + 1
-        competition = {p: (max(hostile[p].values()) if hostile[p] else 0) for p in self.provinces}
+        competition = {
+            province: max(hostile[province].values()) if hostile[province] else 0
+            for province in self.provinces
+        }
+
+        attack, defence = {}, {}
+        urgency = self.victory_urgency()
+        own_gain = sizes[self.power_name]
+        for province in self.provinces:
+            attack_value = defence_value = 0.0
+            if province in self.supply_centres and province not in my_centres:
+                owner = centre_owner.get(province)
+                occupant = units.get(province)
+                holder = owner or (occupant[0] if occupant else None)
+                denial_gain = sizes.get(holder, 0) if holder else 0
+                # An enemy unit on an unowned centre threatens to claim it in
+                # Fall, but the opponent does not yet lose an owned centre.
+                if owner is None and occupant and occupant[0] != self.power_name:
+                    denial_gain *= 0.5
+                gain = 12.0 + own_gain + denial_gain
+
+                if occupant and occupant[0] == self.power_name:
+                    probability = 0.99
+                elif occupant:
+                    defensive_support = min(
+                        MAX_SUPPORT_PRESSURE,
+                        self.support_capacity(province, occupant[0], units))
+                    margin = friendly[province] - (1 + defensive_support)
+                    probability = (0.90 if margin >= 1 else
+                                   0.32 if margin == 0 else 0.08)
+                else:
+                    nearby_force = min(2, friendly[province])
+                    probability = min(
+                        0.97,
+                        (0.68 + 0.12 * nearby_force)
+                        / (1.0 + 0.14 * competition[province]))
+
+                gain *= target_weights.get(province, 1.0)
+                attack_value = gain * probability * (1.0 + 0.75 * urgency)
+
+            if province in my_centres:
+                for neighbour in self.neighbours[province]:
+                    other = unit_owner.get(neighbour)
+                    if other and other != self.power_name:
+                        defence_value = max(defence_value, sizes[other])
+            attack[province] = attack_value
+            defence[province] = defence_value
 
         return attack, defence, friendly, competition
 
@@ -218,17 +484,98 @@ class StudentAgent(Agent):
             for unit in self.game.get_units(power):
                 held.add(base(unit.split()[1]))
         return held
+    def support_offers(self, options):
+        """Index legal support orders by the exact move or unit they support."""
+        offers = {}
+        for location, orders in options.items():
+            for order in orders:
+                if ' S ' in order:
+                    route = order.split(' S ', 1)[1]
+                    offers.setdefault(route, []).append((location, order))
+        return offers
+
+    def resolve_friendly_swaps(self, candidates, chosen, units, options):
+        """Replace reciprocal friendly moves that would bounce head-to-head."""
+        for _ in range(max(1, 2 * len(chosen))):
+            pair = None
+            for origin, entry in list(chosen.items()):
+                order = entry[0]
+                if ' - ' not in order or ' S ' in order or ' C ' in order:
+                    continue
+                if origin in self._convoy_locations:
+                    continue
+                occupant = units.get(base(entry[2]))
+                if not occupant or occupant[0] != self.power_name:
+                    continue
+                other = occupant[2]
+                other_entry = chosen.get(other)
+                if (other != origin and other_entry
+                        and ' - ' in other_entry[0]
+                        and ' S ' not in other_entry[0]
+                        and ' C ' not in other_entry[0]
+                        and other not in self._convoy_locations
+                        and base(other_entry[2]) == base(origin)):
+                    pair = (origin, other)
+                    break
+            if not pair:
+                return
+
+            reserved = {entry[2] for loc, entry in chosen.items()
+                        if loc not in pair}
+            rerouted = False
+            for origin in sorted(pair, key=lambda loc: chosen[loc][1]):
+                other = pair[1] if origin == pair[0] else pair[0]
+                blocked = reserved | {base(other)}
+                for value, location, order, target in candidates:
+                    if (location != origin or target == base(origin)
+                            or target in blocked):
+                        continue
+                    occupant = units.get(target)
+                    if occupant and occupant[0] == self.power_name:
+                        continue
+                    chosen[origin] = [order, value, target]
+                    rerouted = True
+                    break
+                if rerouted:
+                    break
+
+            if not rerouted:
+                # If neither unit has a safe alternative, keep both in place
+                # instead of submitting a guaranteed head-to-head bounce.
+                for origin in pair:
+                    unit = units.get(base(origin))
+                    if not unit or unit[0] != self.power_name:
+                        continue
+                    unit_type, exact_location = unit[1], unit[2]
+                    hold = next((order for order in options.get(exact_location, [])
+                                 if order == f'{unit_type} {exact_location} H'), None)
+                    if hold:
+                        chosen[origin] = [
+                            hold, self.value_of(unit_type, exact_location),
+                            base(exact_location)]
+                return
+
     def movement_orders(self):
         """Pick destinations, add coordinated convoys, then repair the plan twice."""
         self.destination_values()
         options = self.my_options()
+        opening = self.austria_opening_orders(options)
+        if opening is not None:
+            return opening
+
         occupied = self.enemy_occupied()
+        units = self.unit_state()
+        my_centres = set(self.game.get_centers(self.power_name))
+        urgency = self.victory_urgency()
+        support_offers = self.support_offers(options)
         self._convoy_locations = set()
+        self._support_locations = set()
 
         # Every ordinary move and hold, scored by where it lands. A VIA order
         # cannot be treated as an ordinary move: it requires matching fleet
         # convoy orders in the same phase.
         candidates = []
+        current_season = self.game.get_current_phase()[0]
         for location, orders in options.items():
             for order in orders:
                 if ' S ' in order or ' C ' in order or order.endswith(' VIA'):
@@ -236,7 +583,22 @@ class StudentAgent(Agent):
                 words = order.split()
                 unit_type, origin = words[0], words[1]
                 target = words[words.index('-') + 1] if '-' in words else origin
-                candidates.append((self.value_of(unit_type, target), location, order, base(target)))
+                value = self.value_of(unit_type, target)
+
+                # With 17 centres, a realistic Fall capture is the win. Reward
+                # the attack itself, scaled by its local support and defender.
+                province = base(target)
+                if (current_season == 'F' and urgency > 0
+                        and province in self.supply_centres
+                        and province not in my_centres):
+                    matching_supports = support_offers.get(
+                        self.order_signature(order), [])
+                    support_count = sum(1 for support_location, _ in matching_supports
+                                        if support_location != location)
+                    chance = self.capture_probability(
+                        province, occupied, support_count, units)
+                    value *= 1.0 + VICTORY_CAPTURE_MULTIPLIER * urgency * chance
+                candidates.append((value, location, order, province))
 
         candidates.sort(key=lambda c: -c[0])
         candidates = self.jitter(candidates)
@@ -255,12 +617,22 @@ class StudentAgent(Agent):
                 fallback = next((order for order in orders
                                  if ' S ' not in order and ' C ' not in order
                                  and not order.endswith(' VIA')), orders[0])
-                chosen[location] = [fallback, 0.0, base(location)]
+                fallback_target = (base(fallback.split(' - ', 1)[1])
+                                   if ' - ' in fallback else base(location))
+                chosen[location] = [fallback, 0.0, fallback_target]
 
         if self.use_supports:
+            # Supply centres change hands in Fall. Avoid tying up Spring units
+            # on routine border contact; preserve the hold plan for Fall.
+            if current_season == 'F':
+                self.add_support_holds(options, chosen)
             self.add_supports(options, chosen, occupied)
         if self.use_redirect:
             self.redirect_hopeless_attacks(candidates, chosen, occupied)
+        # Austria frequently loses tempo to reciprocal moves around the
+        # Balkans; remove those after support/redirect passes can alter orders.
+        if self.power_name == 'AUSTRIA':
+            self.resolve_friendly_swaps(candidates, chosen, units, options)
         return [entry[0] for entry in chosen.values()]
 
     def add_convoys(self, options, candidates, chosen, claimed, occupied):
@@ -306,20 +678,33 @@ class StudentAgent(Agent):
                 support_orders = []
                 support_cost = 0.0
                 if base(target) in occupied:
-                    needed = 1
+                    units = self.unit_state()
+                    needed = self.support_requirement(base(target), units)
                     choices = []
                     for location, order in support_offers.get(route, []):
                         if location == army_location or location in fleet_locations:
                             continue
                         unit_type = order.split()[0]
                         hold_value = self.value_of(unit_type, location)
-                        cost = max(0.0, regular_best.get(location, hold_value) - hold_value)
+                        cost = max(0.0, regular_best.get(location, hold_value)
+                                   - hold_value)
                         choices.append((cost, location, order))
                     if len(choices) < needed:
                         continue
                     choices.sort(key=lambda choice: choice[0])
                     support_orders = choices[:needed]
                     support_cost = sum(choice[0] for choice in support_orders)
+
+                # Convoyed Fall attacks can also deliver the final centre.
+                province = base(target)
+                urgency = self.victory_urgency()
+                my_centres = set(self.game.get_centers(self.power_name))
+                if (self.game.get_current_phase()[0] == 'F' and urgency > 0
+                        and province in self.supply_centres
+                        and province not in my_centres):
+                    chance = self.capture_probability(
+                        province, occupied, len(support_orders))
+                    value *= 1.0 + VICTORY_CAPTURE_MULTIPLIER * urgency * chance
 
                 utility = value - army_best - fleet_cost - support_cost
                 if utility <= CONVOY_MIN_UTILITY:
@@ -394,31 +779,101 @@ class StudentAgent(Agent):
             i = j
         return result
  
-    def add_supports(self, options, chosen, occupied):
-        """Every unit has strength 1, so an attack on a defended province needs a second unit supporting it or it simply bounces."""
-        offers = {}
+    def add_support_holds(self, options, chosen):
+        """Hold a threatened home centre only against a coordinated attack."""
+        units = self.unit_state()
+        hold_supports = {}
         for location, orders in options.items():
             for order in orders:
-                if ' S ' not in order:
+                if ' S ' not in order or ' - ' in order:
                     continue
-                offers.setdefault(order.split(' S ', 1)[1], []).append(
-                    (location, order))
- 
+                supported_unit = order.split(' S ', 1)[1]
+                hold_supports.setdefault(supported_unit, []).append((location, order))
+
+        converted = set()
+        my_centres = set(self.game.get_centers(self.power_name))
+        for centre in my_centres:
+            defender = units.get(centre)
+            if not defender or defender[0] != self.power_name:
+                continue
+
+            # One enemy unit cannot dislodge an occupant by itself. Count
+            # support-capable units per rival, since different powers do not
+            # combine their attacks without an alliance.
+            hostile_supporters = {}
+            for neighbour in self.neighbours.get(centre, ()):
+                unit = units.get(neighbour)
+                if (unit and unit[0] != self.power_name
+                        and self.can_support(unit[1], unit[2], centre)):
+                    hostile_supporters[unit[0]] = (
+                        hostile_supporters.get(unit[0], 0) + 1)
+            threat_strength = max(hostile_supporters.values(), default=0)
+            needed = min(MAX_SUPPORT_PRESSURE, max(0, threat_strength - 1))
+            if needed == 0:
+                continue
+
+            _, unit_type, exact_location = defender
+            defender_order = f'{unit_type} {exact_location}'
+            defender_location = exact_location
+            # A friendly unit already moving into the centre will replace the
+            # occupant and can keep the centre through Fall.
+            inbound = any(
+                location != defender_location and ' - ' in entry[0]
+                and entry[2] == centre
+                for location, entry in chosen.items()
+            )
+            if inbound:
+                continue
+
+            hold_order = next((order for order in options.get(defender_location, [])
+                               if order == f'{defender_order} H'), None)
+            if not hold_order:
+                continue
+            chosen[defender_location] = [
+                hold_order, self.value_of(unit_type, exact_location), centre]
+
+            candidates = []
+            for location, support_order in hold_supports.get(defender_order, []):
+                if (location == defender_location or location in converted
+                        or location in self._convoy_locations):
+                    continue
+                candidates.append((chosen[location][1], location, support_order))
+            candidates.sort(key=lambda item: item[0])
+            for _, location, support_order in candidates[:needed]:
+                chosen[location] = [
+                    support_order, self.value_of(unit_type, exact_location),
+                    base(location)]
+                converted.add(location)
+                self._support_locations.add(location)
+
+    def add_supports(self, options, chosen, occupied):
+        """Coordinate enough units to beat an occupant and likely support."""
+        offers = self.support_offers(options)
         attacks = sorted((entry for entry in chosen.values()
                           if ' - ' in entry[0] and entry[2] in occupied),
-                         key=lambda e: -e[1])
- 
-        converted = set()
+                         key=lambda entry: -entry[1])
+
+        units = self.unit_state()
+        converted = set(self._support_locations)
+        urgency = self.victory_urgency()
         for order, value, target in attacks:
+            needed = self.support_requirement(target, units)
+            choices = []
             for location, support_order in offers.get(self.order_signature(order), []):
                 if (location in converted or location in self._convoy_locations
                         or chosen[location][0] == order):
                     continue
-                if chosen[location][1] < value:
-                    chosen[location] = [support_order, value, base(location)]
-                    converted.add(location)
-                    break
- 
+                if chosen[location][1] >= value and not (
+                        urgency >= 0.8 and target in self.supply_centres):
+                    continue
+                choices.append((chosen[location][1], location, support_order))
+            choices.sort(key=lambda item: item[0])
+
+            for _, location, support_order in choices[:needed]:
+                chosen[location] = [support_order, value, base(location)]
+                converted.add(location)
+                self._support_locations.add(location)
+
     def redirect_hopeless_attacks(self, candidates, chosen, occupied):
         """An unsupported attack on a defended province bounces every tun.
         Left alone, units lock into that loop for the whole game. Send them
@@ -468,28 +923,100 @@ class StudentAgent(Agent):
                     claimed.add(base(best_target))
         return orders
  
+    @staticmethod
+    def graph_distances(adjacency, starts):
+        """Breadth-first distances on the movement graph for one unit type."""
+        distances = {start: 0 for start in starts if start in adjacency}
+        pending = list(distances)
+        while pending:
+            current = pending.pop(0)
+            for neighbour in adjacency.get(current, []):
+                if neighbour not in distances:
+                    distances[neighbour] = distances[current] + 1
+                    pending.append(neighbour)
+        return distances
+
+    def build_expansion_score(self, unit_type, location, centre_values,
+                              my_centres, units):
+        """Estimate how quickly this build can join a centre-taking front."""
+        adjacency = self.army_adjacency if unit_type == 'A' else self.fleet_adjacency
+        if unit_type == 'A':
+            starts = [base(location)]
+        elif location in adjacency:
+            starts = [location]
+        else:
+            starts = [node for node in adjacency if base(node) == base(location)]
+        distances = self.graph_distances(adjacency, starts)
+
+        fleet_starts = [node for node in self.fleet_adjacency
+                        if base(node) == base(location)]
+        fleet_distances = self.graph_distances(self.fleet_adjacency, fleet_starts)
+        fleet_units = [details[2] for details in units.values()
+                       if details[0] == self.power_name and details[1] == 'F']
+        army_units = [details[2] for details in units.values()
+                      if details[0] == self.power_name and details[1] == 'A']
+
+        score = 0.0
+        for centre in self.supply_centres - my_centres:
+            value = max(1.0, centre_values.get(centre, 0.0))
+            target_nodes = [node for node in adjacency if base(node) == centre]
+            distance = min((distances[node] for node in target_nodes
+                            if node in distances), default=None)
+            if distance is not None:
+                score += value / ((distance + 1) ** 1.5)
+
+            # A coastal army can reach otherwise distant centres by convoy if
+            # friendly fleets are already close enough to form a useful route.
+            target_coasts = [node for node in self.fleet_adjacency
+                             if base(node) == centre]
+            sea_distance = min((fleet_distances[node] for node in target_coasts
+                                if node in fleet_distances), default=None)
+            if sea_distance is None:
+                continue
+            fleet_service = min(
+                (fleet_distances[fleet] for fleet in fleet_units
+                 if fleet in fleet_distances), default=None)
+            if unit_type == 'A' and fleet_service is not None:
+                if distance is None or distance > sea_distance + 2:
+                    score += (0.25 * value /
+                              ((sea_distance + 2) ** 2 * (fleet_service + 1)))
+            elif unit_type == 'F' and army_units:
+                army_nearby = any(
+                    base(army) == base(location)
+                    or base(army) in self.neighbours.get(base(location), set())
+                    for army in army_units)
+                if army_nearby and (distance is None or distance > sea_distance + 1):
+                    score += 0.20 * value / ((sea_distance + 2) ** 2)
+        return score
+
     def adjustment_orders(self):
-        """Builds are optional and very easy to forfeit. Disbands aren't optional at all.
- 
-        Note: builds only work in a home centre we still own and nothing is standing on.
-        Parking our own units at home silently costs us units all game.
-        """
+        """Build where the unit type has the best path to future centres."""
         allowed = self.game.get_state()['builds'][self.power_name]['count']
         if allowed == 0:
             return []
- 
+
         options = self.my_options()
         self.destination_values()
- 
+
         if allowed > 0:
             candidates = []
+            attack_values, _, _, _ = self.province_scores()
+            my_centres = set(self.game.get_centers(self.power_name))
+            units = self.unit_state()
             for location, orders in options.items():
                 for order in orders:
                     if order.endswith(' B'):
                         words = order.split()
-                        candidates.append(
-                            (self.value_of(words[0], words[1]), location, order))
-            candidates.sort(key=lambda c: -c[0])
+                        unit_type, build_location = words[0], words[1]
+                        expansion = self.build_expansion_score(
+                            unit_type, build_location, attack_values,
+                            my_centres, units)
+                        local_value = self.value_of(unit_type, build_location)
+                        role = self.build_role_multiplier(
+                            unit_type, build_location, units)
+                        candidates.append(((expansion + 0.10 * local_value) * role,
+                                           location, order))
+            candidates.sort(key=lambda candidate: -candidate[0])
             chosen, used = [], set()
             for _, location, order in candidates:
                 if location in used:
@@ -499,7 +1026,7 @@ class StudentAgent(Agent):
                 if len(chosen) == allowed:
                     break
             return chosen
- 
+
         candidates = []
         for location, orders in options.items():
             for order in orders:
@@ -507,30 +1034,5 @@ class StudentAgent(Agent):
                     words = order.split()
                     candidates.append(
                         (self.value_of(words[0], words[1]), location, order))
-        candidates.sort(key=lambda c: c[0]) # cheapest units go first
+        candidates.sort(key=lambda candidate: candidate[0])
         return [order for _, _, order in candidates[:abs(allowed)]]
- 
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-   
