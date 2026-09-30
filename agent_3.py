@@ -16,6 +16,7 @@ FALL = {'attack': 600, 'defence': 400, 'proximity': [1000, 100, 30, 10, 6, 5, 4,
 
 STRENGTH_WEIGHT = 1000 # bonus points for friendly unit adjacent to a province
 COMPETITION_WEIGHT = 1000 # reduce points per enemy units adjacent to a province
+CONVOY_MIN_UTILITY = 0.0 # convoy benefit must exceed the fleet/support opportunity cost
 
 
 
@@ -47,11 +48,13 @@ class StudentAgent(Agent):
     '''
 
     @timeout_decorator.timeout(1)
-    def __init__(self, agent_name='DumbBot', use_diffusion=True, use_supports=True, use_redirect=True):
+    def __init__(self, agent_name='DumbBot', use_diffusion=True, use_supports=True,
+                 use_redirect=True, use_convoys=True):
         super().__init__(agent_name)
         self.use_diffusion = use_diffusion
         self.use_supports = use_supports
         self.use_redirect = use_redirect
+        self.use_convoys = use_convoys
 
     @timeout_decorator.timeout(1)
     def new_game(self, game, power_name):
@@ -65,7 +68,6 @@ class StudentAgent(Agent):
         for power_name in all_power_orders.keys():
             self.game.set_orders(power_name, all_power_orders[power_name])
         self.game.process()
-
     @timeout_decorator.timeout(1)
     def get_actions(self):
         """This function is called once per phase. We need to dispatch the right handler"""
@@ -133,7 +135,7 @@ class StudentAgent(Agent):
             # Worth taking. Meaning that a supply centre is being held by someone
             if province in self.supply_centres and province not in my_centres:
                 holder = centre_owner.get(province)
-                attack_value = sizes[holder] if holder else 16 # as 16 is neutral
+                attack_value = sizes[holder] if holder else 16
             # Worth defending. our own centre but has a big enemy close.
             if province in my_centres:
                 for neighbour in self.neighbours[province]:
@@ -195,7 +197,7 @@ class StudentAgent(Agent):
     
     
     # -----
-    # Step 3 - turning these values into orders
+    # Step 3 - tuning these values into orders
     # -----
 
     def my_options(self):
@@ -216,30 +218,33 @@ class StudentAgent(Agent):
             for unit in self.game.get_units(power):
                 held.add(base(unit.split()[1]))
         return held
- 
     def movement_orders(self):
-        """Pick a destination per unit, then repair the plan twice."""
+        """Pick destinations, add coordinated convoys, then repair the plan twice."""
         self.destination_values()
         options = self.my_options()
         occupied = self.enemy_occupied()
- 
-        # Every move and hold available to us, scored by where it lands.
-        # Supports and convoys get skipped here, supports are added later.        
+        self._convoy_locations = set()
+
+        # Every ordinary move and hold, scored by where it lands. A VIA order
+        # cannot be treated as an ordinary move: it requires matching fleet
+        # convoy orders in the same phase.
         candidates = []
         for location, orders in options.items():
             for order in orders:
-                if ' S ' in order or ' C ' in order:
+                if ' S ' in order or ' C ' in order or order.endswith(' VIA'):
                     continue
                 words = order.split()
                 unit_type, origin = words[0], words[1]
                 target = words[words.index('-') + 1] if '-' in words else origin
                 candidates.append((self.value_of(unit_type, target), location, order, base(target)))
- 
+
         candidates.sort(key=lambda c: -c[0])
         candidates = self.jitter(candidates)
- 
-        # Greedy assignment! One unit per destination, so our own units never collide into each other and bounce.
+
+        # Greedy assignment keeps friendly units from bouncing into each other.
         chosen, claimed = {}, set()
+        if self.use_convoys:
+            self.add_convoys(options, candidates, chosen, claimed, occupied)
         for value, location, order, target in candidates:
             if location in chosen or target in claimed:
                 continue
@@ -247,17 +252,136 @@ class StudentAgent(Agent):
             claimed.add(target)
         for location, orders in options.items():
             if location not in chosen:
-                chosen[location] = [orders[0], 0.0, base(location)]
- 
+                fallback = next((order for order in orders
+                                 if ' S ' not in order and ' C ' not in order
+                                 and not order.endswith(' VIA')), orders[0])
+                chosen[location] = [fallback, 0.0, base(location)]
+
         if self.use_supports:
             self.add_supports(options, chosen, occupied)
         if self.use_redirect:
             self.redirect_hopeless_attacks(candidates, chosen, occupied)
         return [entry[0] for entry in chosen.values()]
- 
+
+    def add_convoys(self, options, candidates, chosen, claimed, occupied):
+        """Commit only convoy plans whose army gain pays for fleet coordination."""
+        regular_best = {}
+        for value, location, _, _ in candidates:
+            regular_best[location] = max(regular_best.get(location, float('-inf')), value)
+
+        convoy_offers, support_offers = {}, {}
+        for location, orders in options.items():
+            for order in orders:
+                if ' C A ' in order and ' - ' in order:
+                    route = order.split(' C ', 1)[1]
+                    convoy_offers.setdefault(route, {})[location] = order
+                elif ' S ' in order:
+                    route = order.split(' S ', 1)[1]
+                    support_offers.setdefault(route, []).append((location, order))
+
+        plans = []
+        for army_location, orders in options.items():
+            for army_order in orders:
+                words = army_order.split()
+                if (not words or words[0] != 'A' or not army_order.endswith(' VIA')
+                        or ' - ' not in army_order):
+                    continue
+                origin = words[1]
+                target = words[words.index('-') + 1]
+                route = army_order.rsplit(' VIA', 1)[0]
+                fleet_orders = self.shortest_convoy_chain(
+                    origin, target, convoy_offers.get(route, {}))
+                if not fleet_orders:
+                    continue
+
+                value = self.value_of('A', target)
+                army_best = regular_best.get(
+                    army_location, self.value_of('A', origin))
+                fleet_locations = {location for location, _ in fleet_orders}
+                fleet_cost = sum(
+                    max(0.0, regular_best.get(location, self.value_of('F', location))
+                        - self.value_of('F', location))
+                    for location in fleet_locations)
+
+                support_orders = []
+                support_cost = 0.0
+                if base(target) in occupied:
+                    needed = 1
+                    choices = []
+                    for location, order in support_offers.get(route, []):
+                        if location == army_location or location in fleet_locations:
+                            continue
+                        unit_type = order.split()[0]
+                        hold_value = self.value_of(unit_type, location)
+                        cost = max(0.0, regular_best.get(location, hold_value) - hold_value)
+                        choices.append((cost, location, order))
+                    if len(choices) < needed:
+                        continue
+                    choices.sort(key=lambda choice: choice[0])
+                    support_orders = choices[:needed]
+                    support_cost = sum(choice[0] for choice in support_orders)
+
+                utility = value - army_best - fleet_cost - support_cost
+                if utility <= CONVOY_MIN_UTILITY:
+                    continue
+                plans.append((utility, value, army_location, army_order,
+                              base(target), fleet_orders, support_orders))
+
+        random.shuffle(plans)
+        plans.sort(key=lambda plan: -plan[0])
+        for (_, value, army_location, army_order, target, fleet_orders,
+             support_orders) in plans:
+            fleet_locations = {location for location, _ in fleet_orders}
+            reserved_locations = fleet_locations | {army_location}
+            reserved_locations.update(location for _, location, _ in support_orders)
+            reserved_positions = {base(location) for location in reserved_locations}
+            if (any(location in chosen for location in reserved_locations)
+                    or target in claimed or reserved_positions & claimed):
+                continue
+
+            chosen[army_location] = [army_order, value, target]
+            for fleet_location, fleet_order in fleet_orders:
+                chosen[fleet_location] = [fleet_order, value, base(fleet_location)]
+            for _, support_location, support_order in support_orders:
+                chosen[support_location] = [support_order, value, base(support_location)]
+            claimed.add(target)
+            claimed.update(reserved_positions - {base(army_location)})
+            self._convoy_locations.update(reserved_locations)
+
+    def shortest_convoy_chain(self, origin, target, fleet_orders):
+        """Retun the fewest offered fleets that connect an army to its target."""
+        starts = [location for location in fleet_orders
+                  if self.fleet_near_province(location, origin)]
+        goals = {location for location in fleet_orders
+                 if self.fleet_near_province(location, target)}
+        if not starts or not goals:
+            return []
+
+        pending = [(location, [location]) for location in starts]
+        seen = set(starts)
+        while pending:
+            current, path = pending.pop(0)
+            if current in goals:
+                return [(location, fleet_orders[location]) for location in path]
+            for neighbour in self.fleet_adjacency.get(current, []):
+                if neighbour in fleet_orders and neighbour not in seen:
+                    seen.add(neighbour)
+                    pending.append((neighbour, path + [neighbour]))
+        return []
+
+    def fleet_near_province(self, fleet_location, province):
+        """Whether a convoying fleet touches either coast of an army province."""
+        return any(base(neighbour) == base(province)
+                   for neighbour in self.fleet_adjacency.get(fleet_location, []))
+
+    @staticmethod
+    def order_signature(order):
+        """A support names ``A X - Y``; a convoying army appends ``VIA``."""
+        return order.rsplit(' VIA', 1)[0] if order.endswith(' VIA') else order
+
     def jitter(self, candidates):
         """Shuffle options that are basically tied. Everyone moves at the same instant in this game, so a bot that always picks
-        the same order can be counter-ordered every single turn. Randomising between equally good moves is the cheapest fix for that. """
+        the same order can be counter-ordered every single tun. Randomising between equally good moves is the cheapest fix for that. """
         result, i = [], 0
         while i < len(candidates):
             j, top = i, candidates[i][0]
@@ -286,8 +410,9 @@ class StudentAgent(Agent):
  
         converted = set()
         for order, value, target in attacks:
-            for location, support_order in offers.get(order, []):
-                if location in converted or chosen[location][0] == order:
+            for location, support_order in offers.get(self.order_signature(order), []):
+                if (location in converted or location in self._convoy_locations
+                        or chosen[location][0] == order):
                     continue
                 if chosen[location][1] < value:
                     chosen[location] = [support_order, value, base(location)]
@@ -295,16 +420,17 @@ class StudentAgent(Agent):
                     break
  
     def redirect_hopeless_attacks(self, candidates, chosen, occupied):
-        """An unsupported attack on a defended province bounces every turn.
+        """An unsupported attack on a defended province bounces every tun.
         Left alone, units lock into that loop for the whole game. Send them
         somewhere they can actually arrive."""
-        supported = {order.split(' S ', 1)[1]
+        supported = {self.order_signature(order.split(' S ', 1)[1])
                      for order, _, _ in chosen.values() if ' S ' in order}
         claimed = {entry[2] for entry in chosen.values()}
  
         for location, entry in chosen.items():
             order, value, target = entry
-            if ' - ' not in order or target not in occupied or order in supported:
+            if (' - ' not in order or ' VIA' in order or target not in occupied
+                    or self.order_signature(order) in supported):
                 continue
             for alt_value, alt_location, alt_order, alt_target in candidates:
                 if alt_location != location or alt_order == order:
