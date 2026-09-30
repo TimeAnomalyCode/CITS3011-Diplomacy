@@ -222,3 +222,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+#testing files
+agent_24471981.py
+agent_23170781.py
+report_3.docx
