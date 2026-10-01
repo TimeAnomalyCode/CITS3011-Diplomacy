@@ -10,7 +10,7 @@ MAX_TIMEOUT = 10000
 
 class StudentAgent(Agent):
     @timeout_decorator.timeout(MAX_TIMEOUT)
-    def __init__(self, agent_name="Kratos"):
+    def __init__(self, agent_name="DunceBot"):
         super().__init__(agent_name)
         self.map_graph_army = None
         self.map_graph_navy = None
