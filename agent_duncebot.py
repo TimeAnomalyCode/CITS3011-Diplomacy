@@ -361,16 +361,13 @@ class StudentAgent(Agent):
                 continue
 
             step = best[1][:3]
-            move = next(
-                (
-                    o
-                    for o in opts
-                    if o.split()[2:3] == ["-"]
-                    and o.split()[3][:3] == step
-                    and not o.endswith("VIA")
-                ),
-                None,
-            )
+            prefix = f"{unit} - {step}"
+            move = None
+            for o in opts:
+                if o.startswith(prefix) and not o.endswith("VIA"):
+                    move = o
+                    break
+
             if move and step not in claimed:
                 unit_orders[unit] = move
                 claimed.add(step)
