@@ -5,7 +5,7 @@ import networkx as nx
 import random
 
 # Change to 1 once done
-MAX_TIMEOUT = 10000
+MAX_TIMEOUT = 1
 
 
 class StudentAgent(Agent):
